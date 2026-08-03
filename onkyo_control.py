@@ -41,15 +41,41 @@ def build_packet(command: str) -> bytes:
 
 
 def parse_packet(raw: bytes) -> str:
-    """Extract the ISCP command string from a raw eISCP TCP frame."""
+    """Extract the ISCP command string from a single raw eISCP TCP frame."""
     if len(raw) < 16 or raw[:4] != b"ISCP":
         return ""
     header_size = struct.unpack("!I", raw[4:8])[0]
-    data = raw[header_size:]
+    data_size = struct.unpack("!I", raw[8:12])[0]
+    data = raw[header_size:header_size + data_size]
     # data looks like: !1PWR01\x1a\r\n  (strip leading '!1' and trailing junk)
     text = data.decode("ascii", errors="ignore")
-    text = text.lstrip("!1").strip("\x1a\r\n\x00 ")
+    if text[:2] in ("!1", "!x"):
+        text = text[2:]
+    text = text.strip("\x1a\r\n\x00 ")
     return text
+
+
+def extract_frames(buffer: bytes):
+    """Split a byte buffer into complete eISCP frames plus any leftover bytes."""
+    frames = []
+    while True:
+        if len(buffer) < 16:
+            break
+        if buffer[:4] != b"ISCP":
+            idx = buffer.find(b"ISCP", 1)
+            if idx == -1:
+                buffer = b""
+                break
+            buffer = buffer[idx:]
+            continue
+        header_size = struct.unpack("!I", buffer[4:8])[0]
+        data_size = struct.unpack("!I", buffer[8:12])[0]
+        total_size = header_size + data_size
+        if total_size <= 0 or len(buffer) < total_size:
+            break
+        frames.append(buffer[:total_size])
+        buffer = buffer[total_size:]
+    return frames, buffer
 
 
 class ReceiverConnection:
@@ -60,17 +86,43 @@ class ReceiverConnection:
         self.port = port
         self.timeout = timeout
 
-    def send_command(self, command: str, read_response: bool = True) -> str:
+    def send_command(self, command: str, read_response: bool = True, expect_prefix: str = None) -> str:
+        """Send a command. If read_response is True, read messages from the
+        receiver until one matching expect_prefix arrives (or, if
+        expect_prefix is None, return the first message received). A
+        receiver in network standby can send unrelated status messages
+        interleaved with the actual reply, so we don't stop at the first one
+        unless it's the one we asked for."""
         with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
-            sock.settimeout(self.timeout)
             sock.sendall(build_packet(command))
             if not read_response:
                 return ""
-            try:
-                raw = sock.recv(1024)
-                return parse_packet(raw)
-            except socket.timeout:
-                return ""
+
+            buffer = b""
+            fallback = ""
+            deadline = time.time() + self.timeout
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buffer += chunk
+                frames, buffer = extract_frames(buffer)
+                for frame in frames:
+                    text = parse_packet(frame)
+                    if not text:
+                        continue
+                    if expect_prefix is None or text.startswith(expect_prefix):
+                        return text
+                    if not fallback:
+                        fallback = text
+            return fallback
 
 
 def discover_receivers(timeout: float = 3.0):
@@ -128,6 +180,8 @@ class OnkyoApp(tk.Tk):
             self.status_var.set(f"Configured: {self.host}")
             self.after(300, lambda: self._query_power(False))
             self.after(300, lambda: self._query_power(True))
+            self.after(300, lambda: self._query_volume(False))
+            self.after(300, lambda: self._query_volume(True))
 
     # ---- config ----
     def _load_config(self):
@@ -213,6 +267,8 @@ class OnkyoApp(tk.Tk):
         self.status_var.set(f"Configured: {self.host}")
         self._query_power(False)
         self._query_power(True)
+        self._query_volume(False)
+        self._query_volume(True)
 
     def _discover(self):
         self.status_var.set("Discovering...")
@@ -232,6 +288,8 @@ class OnkyoApp(tk.Tk):
             self.status_var.set(f"Found {model} at {ip}")
             self._query_power(False)
             self._query_power(True)
+            self._query_volume(False)
+            self._query_volume(True)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -261,6 +319,8 @@ class OnkyoApp(tk.Tk):
         # (some AVRs take a moment to actually report the new state).
         self._update_power_indicator(is_zone2, on)
         self.after(1200, lambda: self._query_power(is_zone2))
+        if on:
+            self.after(1200, lambda: self._query_volume(is_zone2))
 
     def _query_power(self, is_zone2):
         if not self.host:
@@ -271,7 +331,7 @@ class OnkyoApp(tk.Tk):
         def worker():
             state = None
             try:
-                resp = conn.send_command(f"{prefix}QSTN", read_response=True)
+                resp = conn.send_command(f"{prefix}QSTN", read_response=True, expect_prefix=prefix)
                 if resp.startswith(prefix):
                     state = resp[len(prefix):len(prefix) + 2] == "01"
             except (socket.timeout, OSError):
@@ -294,6 +354,33 @@ class OnkyoApp(tk.Tk):
             color = "gray"
         if label is not None:
             label.configure(foreground=color)
+
+    def _query_volume(self, is_zone2):
+        if not self.host:
+            return
+        prefix = "ZVL" if is_zone2 else "MVL"
+        conn = ReceiverConnection(self.host)
+
+        def worker():
+            value = None
+            try:
+                resp = conn.send_command(f"{prefix}QSTN", read_response=True, expect_prefix=prefix)
+                if resp.startswith(prefix):
+                    hex_part = resp[len(prefix):]
+                    try:
+                        value = int(hex_part, 16)
+                    except ValueError:
+                        value = None
+            except (socket.timeout, OSError):
+                value = None
+            if value is not None:
+                self.after(0, lambda: self._update_volume(is_zone2, value))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_volume(self, is_zone2, value):
+        var = self.zone2_volume if is_zone2 else self.main_volume
+        var.set(max(0, min(100, value)))
 
     def _volume_set(self, is_zone2, value):
         # ttk.Scale writes raw float precision to its linked variable while
