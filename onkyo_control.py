@@ -117,12 +117,17 @@ class OnkyoApp(tk.Tk):
         self.main_volume = tk.IntVar(value=40)
         self.zone2_volume = tk.IntVar(value=30)
         self.status_var = tk.StringVar(value="Not connected")
+        self.main_power_state = tk.StringVar(value="\u25cf Unknown")
+        self.zone2_power_state = tk.StringVar(value="\u25cf Unknown")
+        self.power_labels = {}  # is_zone2 -> ttk.Label
 
         self._load_config()
         self._build_ui()
 
         if self.host:
             self.status_var.set(f"Configured: {self.host}")
+            self.after(300, lambda: self._query_power(False))
+            self.after(300, lambda: self._query_power(True))
 
     # ---- config ----
     def _load_config(self):
@@ -171,6 +176,11 @@ class OnkyoApp(tk.Tk):
     def _zone_frame(self, title, is_zone2):
         frame = ttk.LabelFrame(self, text=title)
 
+        state_var = self.zone2_power_state if is_zone2 else self.main_power_state
+        status_label = ttk.Label(frame, textvariable=state_var, foreground="gray")
+        status_label.pack(pady=(6, 0))
+        self.power_labels[is_zone2] = status_label
+
         power_row = ttk.Frame(frame)
         power_row.pack(padx=10, pady=8)
         ttk.Button(power_row, text="Power On",
@@ -201,6 +211,8 @@ class OnkyoApp(tk.Tk):
         self.host = self.host_entry.get().strip()
         self._save_config()
         self.status_var.set(f"Configured: {self.host}")
+        self._query_power(False)
+        self._query_power(True)
 
     def _discover(self):
         self.status_var.set("Discovering...")
@@ -218,6 +230,8 @@ class OnkyoApp(tk.Tk):
             self.host_entry.insert(0, ip)
             self._save_config()
             self.status_var.set(f"Found {model} at {ip}")
+            self._query_power(False)
+            self._query_power(True)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -243,6 +257,43 @@ class OnkyoApp(tk.Tk):
     def _power(self, is_zone2, on):
         prefix = "ZPW" if is_zone2 else "PWR"
         self._send(f"{prefix}{'01' if on else '00'}")
+        # Optimistic update, then confirm against the receiver shortly after
+        # (some AVRs take a moment to actually report the new state).
+        self._update_power_indicator(is_zone2, on)
+        self.after(1200, lambda: self._query_power(is_zone2))
+
+    def _query_power(self, is_zone2):
+        if not self.host:
+            return
+        prefix = "ZPW" if is_zone2 else "PWR"
+        conn = ReceiverConnection(self.host)
+
+        def worker():
+            state = None
+            try:
+                resp = conn.send_command(f"{prefix}QSTN", read_response=True)
+                if resp.startswith(prefix):
+                    state = resp[len(prefix):len(prefix) + 2] == "01"
+            except (socket.timeout, OSError):
+                state = None
+            self.after(0, lambda: self._update_power_indicator(is_zone2, state))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_power_indicator(self, is_zone2, on):
+        var = self.zone2_power_state if is_zone2 else self.main_power_state
+        label = self.power_labels.get(is_zone2)
+        if on is True:
+            var.set("\u25cf On")
+            color = "#1a7a1a"
+        elif on is False:
+            var.set("\u25cf Off")
+            color = "#a02020"
+        else:
+            var.set("\u25cf Unknown")
+            color = "gray"
+        if label is not None:
+            label.configure(foreground=color)
 
     def _volume_set(self, is_zone2, value):
         # ttk.Scale writes raw float precision to its linked variable while
