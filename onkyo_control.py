@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+Onkyo TX-NR709 Control App
+---------------------------
+Controls Main and Zone 2 power/volume over the network using Onkyo's
+eISCP protocol (TCP port 60128). Pure standard library - no pip installs
+required. Works on Windows, macOS, and Linux (needs Python 3.7+ with tkinter).
+
+On the receiver, enable: Setup -> Hardware -> Network -> Network Control
+(otherwise it won't respond to commands while in standby).
+"""
+
+import json
+import os
+import socket
+import struct
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+EISCP_PORT = 60128
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".onkyo_control.json")
+
+# ---------------------------------------------------------------------------
+# eISCP protocol helpers
+# ---------------------------------------------------------------------------
+
+def build_packet(command: str) -> bytes:
+    """Wrap an ISCP command string (e.g. 'PWR01') in an eISCP TCP frame."""
+    iscp_msg = f"!1{command}\r"
+    data = iscp_msg.encode("ascii")
+    header = struct.pack(
+        "!4sIIcxxx",
+        b"ISCP",
+        16,          # header size
+        len(data),   # data size
+        b"\x01",     # version
+    )
+    return header + data
+
+
+def parse_packet(raw: bytes) -> str:
+    """Extract the ISCP command string from a raw eISCP TCP frame."""
+    if len(raw) < 16 or raw[:4] != b"ISCP":
+        return ""
+    header_size = struct.unpack("!I", raw[4:8])[0]
+    data = raw[header_size:]
+    # data looks like: !1PWR01\x1a\r\n  (strip leading '!1' and trailing junk)
+    text = data.decode("ascii", errors="ignore")
+    text = text.lstrip("!1").strip("\x1a\r\n\x00 ")
+    return text
+
+
+class ReceiverConnection:
+    """A small persistent-ish TCP connection to the receiver."""
+
+    def __init__(self, host: str, port: int = EISCP_PORT, timeout: float = 3.0):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+
+    def send_command(self, command: str, read_response: bool = True) -> str:
+        with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+            sock.settimeout(self.timeout)
+            sock.sendall(build_packet(command))
+            if not read_response:
+                return ""
+            try:
+                raw = sock.recv(1024)
+                return parse_packet(raw)
+            except socket.timeout:
+                return ""
+
+
+def discover_receivers(timeout: float = 3.0):
+    """Broadcast an eISCP discovery packet and collect responses."""
+    msg = "!xECNQSTN"
+    data = msg.encode("ascii")
+    header = struct.pack("!4sIIcxxx", b"ISCP", 16, len(data), b"\x01")
+    packet = header + data
+
+    found = {}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, ("255.255.255.255", EISCP_PORT))
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                raw, addr = sock.recvfrom(1024)
+            except socket.timeout:
+                break
+            text = parse_packet(raw)
+            # response looks like: ECNmodel_name/port/area/id
+            if text.startswith("ECN"):
+                parts = text[3:].split("/")
+                model = parts[0] if parts else "Unknown"
+                found[addr[0]] = model
+    finally:
+        sock.close()
+    return found
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class OnkyoApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Onkyo TX-NR709 Control")
+        self.resizable(False, False)
+        self.host = None
+        self.main_volume = tk.IntVar(value=40)
+        self.zone2_volume = tk.IntVar(value=30)
+        self.status_var = tk.StringVar(value="Not connected")
+
+        self._load_config()
+        self._build_ui()
+
+        if self.host:
+            self.status_var.set(f"Configured: {self.host}")
+
+    # ---- config ----
+    def _load_config(self):
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH) as f:
+                    cfg = json.load(f)
+                    self.host = cfg.get("host")
+            except Exception:
+                self.host = None
+
+    def _save_config(self):
+        try:
+            with open(CONFIG_PATH, "w") as f:
+                json.dump({"host": self.host}, f)
+        except Exception:
+            pass
+
+    # ---- UI ----
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 6}
+
+        conn_frame = ttk.LabelFrame(self, text="Receiver")
+        conn_frame.grid(row=0, column=0, columnspan=2, sticky="ew", **pad)
+
+        self.host_entry = ttk.Entry(conn_frame, width=20)
+        self.host_entry.grid(row=0, column=0, padx=6, pady=6)
+        if self.host:
+            self.host_entry.insert(0, self.host)
+        else:
+            self.host_entry.insert(0, "receiver IP")
+
+        ttk.Button(conn_frame, text="Set IP", command=self._set_host).grid(row=0, column=1, padx=4)
+        ttk.Button(conn_frame, text="Discover", command=self._discover).grid(row=0, column=2, padx=4)
+
+        ttk.Label(conn_frame, textvariable=self.status_var, foreground="gray").grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6)
+        )
+
+        main_frame = self._zone_frame("Main Zone", is_zone2=False)
+        main_frame.grid(row=1, column=0, sticky="nsew", **pad)
+
+        zone2_frame = self._zone_frame("Zone 2", is_zone2=True)
+        zone2_frame.grid(row=1, column=1, sticky="nsew", **pad)
+
+    def _zone_frame(self, title, is_zone2):
+        frame = ttk.LabelFrame(self, text=title)
+
+        power_row = ttk.Frame(frame)
+        power_row.pack(padx=10, pady=8)
+        ttk.Button(power_row, text="Power On",
+                   command=lambda: self._power(is_zone2, True)).pack(side="left", padx=4)
+        ttk.Button(power_row, text="Power Off",
+                   command=lambda: self._power(is_zone2, False)).pack(side="left", padx=4)
+
+        var = self.zone2_volume if is_zone2 else self.main_volume
+        vol_label = ttk.Label(frame, text="Volume")
+        vol_label.pack(pady=(4, 0))
+
+        vol_row = ttk.Frame(frame)
+        vol_row.pack(padx=10, pady=4)
+        ttk.Button(vol_row, text="-", width=3,
+                   command=lambda: self._volume_step(is_zone2, -1)).pack(side="left")
+        scale = ttk.Scale(vol_row, from_=0, to=100, orient="horizontal", length=160,
+                           variable=var, command=lambda v: self._volume_set(is_zone2, int(float(v))))
+        scale.pack(side="left", padx=6)
+        ttk.Button(vol_row, text="+", width=3,
+                   command=lambda: self._volume_step(is_zone2, 1)).pack(side="left")
+
+        ttk.Label(frame, textvariable=var).pack(pady=(0, 6))
+
+        return frame
+
+    # ---- actions ----
+    def _set_host(self):
+        self.host = self.host_entry.get().strip()
+        self._save_config()
+        self.status_var.set(f"Configured: {self.host}")
+
+    def _discover(self):
+        self.status_var.set("Discovering...")
+        self.update_idletasks()
+
+        def worker():
+            found = discover_receivers()
+            if not found:
+                self.status_var.set("No receivers found on this network")
+                return
+            ip = list(found.keys())[0]
+            model = found[ip]
+            self.host = ip
+            self.host_entry.delete(0, tk.END)
+            self.host_entry.insert(0, ip)
+            self._save_config()
+            self.status_var.set(f"Found {model} at {ip}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _require_host(self):
+        if not self.host:
+            messagebox.showwarning("No receiver", "Set the receiver's IP address first (or click Discover).")
+            return False
+        return True
+
+    def _send(self, command):
+        if not self._require_host():
+            return
+        conn = ReceiverConnection(self.host)
+
+        def worker():
+            try:
+                conn.send_command(command, read_response=False)
+            except (socket.timeout, OSError) as e:
+                self.status_var.set(f"Error: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _power(self, is_zone2, on):
+        prefix = "ZPW" if is_zone2 else "PWR"
+        self._send(f"{prefix}{'01' if on else '00'}")
+
+    def _volume_set(self, is_zone2, value):
+        # ttk.Scale writes raw float precision to its linked variable while
+        # dragging; re-set it here as a clean int so the label doesn't show
+        # long decimal noise.
+        var = self.zone2_volume if is_zone2 else self.main_volume
+        var.set(int(value))
+
+        prefix = "ZVL" if is_zone2 else "MVL"
+        self._send(f"{prefix}{value:02X}")
+
+    def _volume_step(self, is_zone2, delta):
+        var = self.zone2_volume if is_zone2 else self.main_volume
+        new_val = max(0, min(100, var.get() + delta))
+        var.set(new_val)
+        self._volume_set(is_zone2, new_val)
+
+
+if __name__ == "__main__":
+    app = OnkyoApp()
+    app.mainloop()
