@@ -221,6 +221,7 @@ class OnkyoApp(tk.Tk):
 
         ttk.Button(conn_frame, text="Set IP", command=self._set_host).grid(row=0, column=1, padx=4)
         ttk.Button(conn_frame, text="Discover", command=self._discover).grid(row=0, column=2, padx=4)
+        ttk.Button(conn_frame, text="Fetch Status", command=self._fetch_status).grid(row=0, column=3, padx=4)
 
         ttk.Label(conn_frame, textvariable=self.status_var, foreground="gray").grid(
             row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6)
@@ -319,6 +320,18 @@ class OnkyoApp(tk.Tk):
             messagebox.showwarning("No receiver", "Set the receiver's IP address first (or click Discover).")
             return False
         return True
+
+    def _fetch_status(self):
+        if not self._require_host():
+            return
+        self.status_var.set("Fetching status...")
+        self._query_power(False)
+        self._query_power(True)
+        self._query_volume(False)
+        self._query_volume(True)
+        self._query_mute(False)
+        self._query_mute(True)
+        self.after(1500, lambda: self.status_var.set(f"Status updated: {self.host}"))
 
     def _send(self, command):
         if not self._require_host():
