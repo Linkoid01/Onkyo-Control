@@ -172,6 +172,9 @@ class OnkyoApp(tk.Tk):
         self.main_power_state = tk.StringVar(value="\u25cf Unknown")
         self.zone2_power_state = tk.StringVar(value="\u25cf Unknown")
         self.power_labels = {}  # is_zone2 -> ttk.Label
+        self.main_mute_state = tk.StringVar(value="\u25cf Unknown")
+        self.zone2_mute_state = tk.StringVar(value="\u25cf Unknown")
+        self.mute_labels = {}  # is_zone2 -> ttk.Label
 
         self._load_config()
         self._build_ui()
@@ -182,6 +185,8 @@ class OnkyoApp(tk.Tk):
             self.after(300, lambda: self._query_power(True))
             self.after(300, lambda: self._query_volume(False))
             self.after(300, lambda: self._query_volume(True))
+            self.after(300, lambda: self._query_mute(False))
+            self.after(300, lambda: self._query_mute(True))
 
     # ---- config ----
     def _load_config(self):
@@ -258,6 +263,18 @@ class OnkyoApp(tk.Tk):
 
         ttk.Label(frame, textvariable=var).pack(pady=(0, 6))
 
+        mute_state_var = self.zone2_mute_state if is_zone2 else self.main_mute_state
+        mute_status_label = ttk.Label(frame, textvariable=mute_state_var, foreground="gray")
+        mute_status_label.pack(pady=(2, 0))
+        self.mute_labels[is_zone2] = mute_status_label
+
+        mute_row = ttk.Frame(frame)
+        mute_row.pack(padx=10, pady=(4, 8))
+        ttk.Button(mute_row, text="Mute", width=8,
+                   command=lambda: self._mute(is_zone2, True)).pack(side="left", padx=4)
+        ttk.Button(mute_row, text="Unmute", width=8,
+                   command=lambda: self._mute(is_zone2, False)).pack(side="left", padx=4)
+
         return frame
 
     # ---- actions ----
@@ -269,6 +286,8 @@ class OnkyoApp(tk.Tk):
         self._query_power(True)
         self._query_volume(False)
         self._query_volume(True)
+        self._query_mute(False)
+        self._query_mute(True)
 
     def _discover(self):
         self.status_var.set("Discovering...")
@@ -290,6 +309,8 @@ class OnkyoApp(tk.Tk):
             self._query_power(True)
             self._query_volume(False)
             self._query_volume(True)
+            self._query_mute(False)
+            self._query_mute(True)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -349,6 +370,45 @@ class OnkyoApp(tk.Tk):
         elif on is False:
             var.set("\u25cf Off")
             color = "#a02020"
+        else:
+            var.set("\u25cf Unknown")
+            color = "gray"
+        if label is not None:
+            label.configure(foreground=color)
+
+    def _mute(self, is_zone2, mute_on):
+        prefix = "ZMT" if is_zone2 else "AMT"
+        self._send(f"{prefix}{'01' if mute_on else '00'}")
+        self._update_mute_indicator(is_zone2, mute_on)
+        self.after(800, lambda: self._query_mute(is_zone2))
+
+    def _query_mute(self, is_zone2):
+        if not self.host:
+            return
+        prefix = "ZMT" if is_zone2 else "AMT"
+        conn = ReceiverConnection(self.host)
+
+        def worker():
+            state = None
+            try:
+                resp = conn.send_command(f"{prefix}QSTN", read_response=True, expect_prefix=prefix)
+                if resp.startswith(prefix):
+                    state = resp[len(prefix):len(prefix) + 2] == "01"
+            except (socket.timeout, OSError):
+                state = None
+            self.after(0, lambda: self._update_mute_indicator(is_zone2, state))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_mute_indicator(self, is_zone2, muted):
+        var = self.zone2_mute_state if is_zone2 else self.main_mute_state
+        label = self.mute_labels.get(is_zone2)
+        if muted is True:
+            var.set("\u25cf Muted")
+            color = "#a02020"
+        elif muted is False:
+            var.set("\u25cf Not muted")
+            color = "#1a7a1a"
         else:
             var.set("\u25cf Unknown")
             color = "gray"
