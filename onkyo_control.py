@@ -22,6 +22,54 @@ from tkinter import ttk, messagebox
 EISCP_PORT = 60128
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".onkyo_control.json")
 
+# Full input source list documented for the TX-NR709 (SLI command, from the
+# onkyo-eiscp project's protocol reference). Zone 2 uses the same codes via
+# the SLZ command; not every source is guaranteed to be selectable on Zone 2
+# specifically, and a handful of entries (Airplay/Bluetooth/DAB/Strm Box) are
+# protocol placeholders that may not correspond to a real feature on this
+# particular unit's hardware/firmware. The receiver will simply not switch
+# if a code isn't actually supported.
+INPUT_SOURCES = [
+    ("00", "VIDEO1 / VCR/DVR"),
+    ("01", "VIDEO2 / CBL/SAT"),
+    ("02", "VIDEO3 / GAME"),
+    ("03", "VIDEO4 / AUX1"),
+    ("04", "VIDEO5 / AUX2"),
+    ("05", "VIDEO6 / PC"),
+    ("06", "VIDEO7"),
+    ("07", "Hidden1 / EXTRA1"),
+    ("08", "Hidden2 / EXTRA2"),
+    ("09", "Hidden3 / EXTRA3"),
+    ("10", "DVD / BD"),
+    ("11", "STRM BOX"),
+    ("12", "TV"),
+    ("20", "TAPE(1) / TV-TAPE"),
+    ("21", "TAPE2"),
+    ("22", "PHONO"),
+    ("23", "CD / TV-CD"),
+    ("24", "FM"),
+    ("25", "AM"),
+    ("26", "TUNER"),
+    ("27", "MUSIC SERVER / DLNA"),
+    ("28", "INTERNET RADIO"),
+    ("29", "USB (Front)"),
+    ("2A", "USB (Rear)"),
+    ("2B", "NETWORK"),
+    ("2C", "USB (toggle)"),
+    ("2D", "AirPlay"),
+    ("2E", "Bluetooth"),
+    ("30", "MULTI CH"),
+    ("31", "XM"),
+    ("32", "SIRIUS"),
+    ("33", "DAB"),
+    ("40", "Universal PORT"),
+    ("55", "HDMI 5"),
+    ("56", "HDMI 6"),
+    ("57", "HDMI 7"),
+]
+SOURCE_LABEL_TO_CODE = {label: code for code, label in INPUT_SOURCES}
+SOURCE_CODE_TO_LABEL = {code: label for code, label in INPUT_SOURCES}
+
 # ---------------------------------------------------------------------------
 # eISCP protocol helpers
 # ---------------------------------------------------------------------------
@@ -175,6 +223,9 @@ class OnkyoApp(tk.Tk):
         self.main_mute_state = tk.StringVar(value="\u25cf Unknown")
         self.zone2_mute_state = tk.StringVar(value="\u25cf Unknown")
         self.mute_labels = {}  # is_zone2 -> ttk.Label
+        self.main_source = tk.StringVar(value="")
+        self.zone2_source = tk.StringVar(value="")
+        self.source_combos = {}  # is_zone2 -> ttk.Combobox
 
         self._load_config()
         self._build_ui()
@@ -187,6 +238,8 @@ class OnkyoApp(tk.Tk):
             self.after(300, lambda: self._query_volume(True))
             self.after(300, lambda: self._query_mute(False))
             self.after(300, lambda: self._query_mute(True))
+            self.after(300, lambda: self._query_source(False))
+            self.after(300, lambda: self._query_source(True))
 
     # ---- config ----
     def _load_config(self):
@@ -276,6 +329,15 @@ class OnkyoApp(tk.Tk):
         ttk.Button(mute_row, text="Unmute", width=8,
                    command=lambda: self._mute(is_zone2, False)).pack(side="left", padx=4)
 
+        ttk.Label(frame, text="Source").pack(pady=(0, 2))
+        source_var = self.zone2_source if is_zone2 else self.main_source
+        combo = ttk.Combobox(frame, textvariable=source_var, state="readonly",
+                              values=[label for _, label in INPUT_SOURCES], width=20)
+        combo.pack(padx=10, pady=(0, 10))
+        combo.bind("<<ComboboxSelected>>",
+                   lambda event: self._select_source(is_zone2, source_var.get()))
+        self.source_combos[is_zone2] = combo
+
         return frame
 
     # ---- actions ----
@@ -289,6 +351,8 @@ class OnkyoApp(tk.Tk):
         self._query_volume(True)
         self._query_mute(False)
         self._query_mute(True)
+        self._query_source(False)
+        self._query_source(True)
 
     def _discover(self):
         self.status_var.set("Discovering...")
@@ -312,6 +376,8 @@ class OnkyoApp(tk.Tk):
             self._query_volume(True)
             self._query_mute(False)
             self._query_mute(True)
+            self._query_source(False)
+            self._query_source(True)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -331,6 +397,8 @@ class OnkyoApp(tk.Tk):
         self._query_volume(True)
         self._query_mute(False)
         self._query_mute(True)
+        self._query_source(False)
+        self._query_source(True)
         self.after(1500, lambda: self.status_var.set(f"Status updated: {self.host}"))
 
     def _send(self, command):
@@ -427,6 +495,38 @@ class OnkyoApp(tk.Tk):
             color = "gray"
         if label is not None:
             label.configure(foreground=color)
+
+    def _select_source(self, is_zone2, label):
+        code = SOURCE_LABEL_TO_CODE.get(label)
+        if code is None:
+            return
+        prefix = "SLZ" if is_zone2 else "SLI"
+        self._send(f"{prefix}{code}")
+        self.after(800, lambda: self._query_source(is_zone2))
+
+    def _query_source(self, is_zone2):
+        if not self.host:
+            return
+        prefix = "SLZ" if is_zone2 else "SLI"
+        conn = ReceiverConnection(self.host)
+
+        def worker():
+            label = None
+            try:
+                resp = conn.send_command(f"{prefix}QSTN", read_response=True, expect_prefix=prefix)
+                if resp.startswith(prefix):
+                    code = resp[len(prefix):len(prefix) + 2].upper()
+                    label = SOURCE_CODE_TO_LABEL.get(code)
+            except (socket.timeout, OSError):
+                label = None
+            if label is not None:
+                self.after(0, lambda: self._update_source(is_zone2, label))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_source(self, is_zone2, label):
+        var = self.zone2_source if is_zone2 else self.main_source
+        var.set(label)
 
     def _query_volume(self, is_zone2):
         if not self.host:
